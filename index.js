@@ -18,6 +18,8 @@ import {
 import imaps from 'imap-simple';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
+import fs from 'fs';
+import path from 'path';
 
 // Configuration from environment variables
 const IMAP_CONFIG = {
@@ -135,6 +137,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         }
       },
       {
+        name: 'get_attachment',
+        description: 'Download an email attachment by UID and filename, saving it to a local file path',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            uid: {
+              type: 'number',
+              description: 'Email UID'
+            },
+            folder: {
+              type: 'string',
+              description: 'Folder name (default: INBOX)',
+              default: 'INBOX'
+            },
+            filename: {
+              type: 'string',
+              description: 'Attachment filename to download (must match the filename returned by get_email)'
+            },
+            save_path: {
+              type: 'string',
+              description: 'Local absolute file path to save the attachment to'
+            }
+          },
+          required: ['uid', 'filename', 'save_path']
+        }
+      },
+      {
         name: 'search_emails',
         description: 'Search emails by subject, from, or body text',
         inputSchema: {
@@ -224,6 +253,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             bcc: {
               type: 'string',
               description: 'BCC recipients, comma-separated'
+            },
+            attachment_paths: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Local absolute file paths to attach'
             }
           },
           required: ['to', 'subject']
@@ -262,6 +296,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             bcc: {
               type: 'string',
               description: 'BCC recipients'
+            },
+            attachment_paths: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Local absolute file paths to attach'
             }
           },
           required: ['uid', 'to', 'subject']
@@ -358,6 +397,82 @@ async function findDraftsFolder(connection) {
   }
 
   return 'Drafts'; // Default fallback
+}
+
+// MIME helpers
+function getContentType(filename) {
+  const ext = path.extname(filename).toLowerCase();
+  const map = {
+    '.pdf': 'application/pdf',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.txt': 'text/plain',
+    '.doc': 'application/msword',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xls': 'application/vnd.ms-excel',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.zip': 'application/zip'
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+function buildMimeMessage(args, fromUser) {
+  let message = '';
+  message += `From: ${fromUser}\r\n`;
+  message += `To: ${args.to}\r\n`;
+  if (args.cc) message += `Cc: ${args.cc}\r\n`;
+  if (args.bcc) message += `Bcc: ${args.bcc}\r\n`;
+  message += `Subject: ${args.subject}\r\n`;
+  message += `Date: ${new Date().toUTCString()}\r\n`;
+  message += `MIME-Version: 1.0\r\n`;
+
+  const altBoundary = `----=_Alt_${Date.now()}`;
+  const buildBodyPart = () => {
+    let part = '';
+    if (args.html) {
+      part += `Content-Type: multipart/alternative; boundary="${altBoundary}"\r\n\r\n`;
+      part += `--${altBoundary}\r\n`;
+      part += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
+      part += `${args.body || ''}\r\n`;
+      part += `--${altBoundary}\r\n`;
+      part += `Content-Type: text/html; charset=utf-8\r\n\r\n`;
+      part += `${args.html}\r\n`;
+      part += `--${altBoundary}--\r\n`;
+    } else {
+      part += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
+      part += `${args.body || ''}\r\n`;
+    }
+    return part;
+  };
+
+  const attachmentPaths = args.attachment_paths || [];
+  if (attachmentPaths.length === 0) {
+    message += buildBodyPart();
+    return message;
+  }
+
+  const mixedBoundary = `----=_Mixed_${Date.now()}`;
+  message += `Content-Type: multipart/mixed; boundary="${mixedBoundary}"\r\n\r\n`;
+  message += `--${mixedBoundary}\r\n`;
+  message += buildBodyPart();
+  message += `\r\n`;
+
+  for (const filePath of attachmentPaths) {
+    const fileData = fs.readFileSync(filePath);
+    const base64Data = fileData.toString('base64');
+    const filename = path.basename(filePath);
+    const contentType = getContentType(filename);
+    message += `--${mixedBoundary}\r\n`;
+    message += `Content-Type: ${contentType}; name="${filename}"\r\n`;
+    message += `Content-Transfer-Encoding: base64\r\n`;
+    message += `Content-Disposition: attachment; filename="${filename}"\r\n\r\n`;
+    message += base64Data.match(/.{1,76}/g).join('\r\n') + '\r\n';
+  }
+  message += `--${mixedBoundary}--\r\n`;
+
+  return message;
 }
 
 // Tool handlers
@@ -471,6 +586,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               }, null, 2)
             }]
           };
+        } finally {
+          connection.end();
+        }
+      }
+
+      case 'get_attachment': {
+        const folder = args.folder || 'INBOX';
+        const connection = await connectIMAP();
+
+        try {
+          await connection.openBox(folder);
+
+          const fetchOptions = {
+            bodies: [''],
+            struct: true
+          };
+
+          const messages = await connection.search([['UID', args.uid]], fetchOptions);
+
+          if (messages.length === 0) {
+            return { content: [{ type: 'text', text: 'Email not found' }], isError: true };
+          }
+
+          const msg = messages[0];
+          const rawBody = msg.parts.find(p => p.which === '')?.body;
+          const parsed = await simpleParser(rawBody);
+
+          const attachment = parsed.attachments?.find(a => a.filename === args.filename);
+          if (!attachment) {
+            return { content: [{ type: 'text', text: `Attachment not found: ${args.filename}` }], isError: true };
+          }
+
+          fs.writeFileSync(args.save_path, attachment.content);
+
+          return { content: [{ type: 'text', text: `Saved attachment to ${args.save_path} (${attachment.content.length} bytes)` }] };
         } finally {
           connection.end();
         }
@@ -593,31 +743,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         try {
           const draftsFolder = await findDraftsFolder(connection);
-
-          // Build RFC 2822 compliant email message
-          const boundary = `----=_Part_${Date.now()}`;
-          let message = '';
-          message += `From: ${IMAP_CONFIG.imap.user}\r\n`;
-          message += `To: ${args.to}\r\n`;
-          if (args.cc) message += `Cc: ${args.cc}\r\n`;
-          if (args.bcc) message += `Bcc: ${args.bcc}\r\n`;
-          message += `Subject: ${args.subject}\r\n`;
-          message += `Date: ${new Date().toUTCString()}\r\n`;
-          message += `MIME-Version: 1.0\r\n`;
-
-          if (args.html) {
-            message += `Content-Type: multipart/alternative; boundary="${boundary}"\r\n\r\n`;
-            message += `--${boundary}\r\n`;
-            message += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
-            message += `${args.body || ''}\r\n`;
-            message += `--${boundary}\r\n`;
-            message += `Content-Type: text/html; charset=utf-8\r\n\r\n`;
-            message += `${args.html}\r\n`;
-            message += `--${boundary}--\r\n`;
-          } else {
-            message += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
-            message += `${args.body || ''}\r\n`;
-          }
+          const message = buildMimeMessage(args, IMAP_CONFIG.imap.user);
 
           await connection.append(message, { mailbox: draftsFolder, flags: ['\\Draft'] });
 
@@ -641,29 +767,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           // Create new draft
           await connection.openBox(draftsFolder);
 
-          const boundary = `----=_Part_${Date.now()}`;
-          let message = '';
-          message += `From: ${IMAP_CONFIG.imap.user}\r\n`;
-          message += `To: ${args.to}\r\n`;
-          if (args.cc) message += `Cc: ${args.cc}\r\n`;
-          if (args.bcc) message += `Bcc: ${args.bcc}\r\n`;
-          message += `Subject: ${args.subject}\r\n`;
-          message += `Date: ${new Date().toUTCString()}\r\n`;
-          message += `MIME-Version: 1.0\r\n`;
-
-          if (args.html) {
-            message += `Content-Type: multipart/alternative; boundary="${boundary}"\r\n\r\n`;
-            message += `--${boundary}\r\n`;
-            message += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
-            message += `${args.body || ''}\r\n`;
-            message += `--${boundary}\r\n`;
-            message += `Content-Type: text/html; charset=utf-8\r\n\r\n`;
-            message += `${args.html}\r\n`;
-            message += `--${boundary}--\r\n`;
-          } else {
-            message += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
-            message += `${args.body || ''}\r\n`;
-          }
+          const message = buildMimeMessage(args, IMAP_CONFIG.imap.user);
 
           await connection.append(message, { mailbox: draftsFolder, flags: ['\\Draft'] });
 
